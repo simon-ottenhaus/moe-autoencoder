@@ -4,6 +4,25 @@ This repo combines Mixture of Experts (MoE) and Autoencoders (AE) for representa
 The goal is to learn low dimensional manifold representations of higher dimensional data.
 Currently, this is a proof of concept using synthetic data, illustrating the basic principles.
 
+## Setup & Usage
+
+The code is written in Python 3.10 and uses PyTorch 2.2. The setup is as any other Python project:
+
+```bash
+git clone https://github.com/simon-ottenhaus/moe-autoencoder.git
+cd moe-autoencoder
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+
+# train the models (is pre-set to GPU training)
+python train_representations.py
+```
+
+Then open [analyze_data.ipynb](analyze_data.ipynb) and run all the cells to see the results in the [figures](figures) folder.
+
+## Problem statement
+
 The task is to find `1D` representations of `2D` data, where a continous `1D` representation is analytically know but hard to represent in a neural network.
 The considered functions are: `circle`, `spiral` and `figure8`, the data is generated as follows:
 
