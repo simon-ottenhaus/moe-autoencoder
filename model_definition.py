@@ -1,4 +1,4 @@
-from typing import Callable
+from typing import Callable, NamedTuple
 
 import torch
 import torch.nn as nn
@@ -41,7 +41,7 @@ class FCBlock(nn.Module):
         else:
             raise ValueError(f"Activation {activation} is not supported")
 
-    def forward(self, x):
+    def forward(self, x) -> torch.Tensor:
         x = self.fc(x)
         x = self.act(x)
         x = self.dropout(x)
@@ -141,16 +141,41 @@ class Router(nn.Module):
             x = block(x)
 
         return x
+    
+
+class GaussianNoiseConfig(BaseModel):
+    mean: float
+    std: float
         
+class GaussianNoiseLayer(nn.Module):
+    """
+    Adds Gaussian noise to the input during training.
+    """
+
+    def __init__(self, args: GaussianNoiseConfig):
+        super().__init__()
+        self.mean = args.mean
+        self.std = args.std
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.training:
+            noise = torch.randn_like(x) * self.std + self.mean
+            return x + noise
+        else:
+            return x
+        
+
+AutoEncoderOutput = NamedTuple("AutoEncoderOutput", [("encoder_output", torch.Tensor), ("decoder_output", torch.Tensor)])
 
 class AutoEncoder(nn.Module):
     """
     Takes an encoder and a decoder and applies them sequentially.
     """
-    def __init__(self, encoder: FCEncoder, decoder: FCEncoder):
+    def __init__(self, encoder: FCEncoder, decoder: FCEncoder, noise: GaussianNoiseLayer):
         super().__init__()
         self.encoder = encoder
         self.decoder = decoder
+        self.noise = noise
 
         # check dimension compatibility
         if encoder.args.output_dim != decoder.args.input_dim:
@@ -164,17 +189,25 @@ class AutoEncoder(nn.Module):
                 f"does not match decoder output dimension {decoder.args.output_dim}"
             )
         
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> AutoEncoderOutput:
         """
         Args:
             x: (batch_size, input_dim)
         Returns:
             (batch_size, output_dim)
         """
-        x = self.encoder(x)
-        x = self.decoder(x)
-        return x
+        enc_cout = self.encoder(x)
+        x = self.noise(enc_cout)
+        dec_out = self.decoder(x)
+        return AutoEncoderOutput(enc_cout, dec_out)
     
+
+RoutedAutoEncoderOutput = NamedTuple("RoutedAutoEncoderOutput", [
+    ("reconstruction", torch.Tensor),
+    ("routing_logits", torch.Tensor),
+    ("expert_outputs", torch.Tensor),
+])
+
 class RoutedAutoEncoder(nn.Module):
     """
     Composes a list of autoencoders with a router.
@@ -185,12 +218,16 @@ class RoutedAutoEncoder(nn.Module):
             encoder_args: FCEncoderConfig,
             decoder_args: FCEncoderConfig,
             router_args: FCEncoderConfig,
+            latent_noise_args: GaussianNoiseConfig,
+            router_noise_args: GaussianNoiseConfig,
             num_experts: int
         ):
         super().__init__()
         self.encoder_args = encoder_args
         self.decoder_args = decoder_args
         self.router_args = router_args
+        self.latent_noise_args = latent_noise_args
+        self.router_noise_args = router_noise_args
         self.num_experts = num_experts
 
         # check dimension compatibility
@@ -203,28 +240,28 @@ class RoutedAutoEncoder(nn.Module):
         for _ in range(num_experts):
             encoder = FCEncoder(encoder_args)
             decoder = FCEncoder(decoder_args)
-            self.autoencoders.append(AutoEncoder(encoder, decoder))
+            noise = GaussianNoiseLayer(latent_noise_args)
+            self.autoencoders.append(AutoEncoder(encoder, decoder, noise))
         
         self.router = Router(router_args)
+        self.router_noise = GaussianNoiseLayer(router_noise_args)
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor) -> RoutedAutoEncoderOutput:
         """
         Args:
             x: (batch_size, input_dim)
         Returns:
             (batch_size, output_dim)
         """
-        routing_logits = self.router(x)
+        router_input = self.router_noise(x)
+        routing_logits = self.router(router_input)
         routing_probs = torch.softmax(routing_logits, dim=-1)
 
-        # output = torch.zeros_like(x)
-        # for i in range(self.num_experts):
-        #     expert_output = self.autoencoders[i](x)
-        #     output += routing_probs[:, i].unsqueeze(-1) * expert_output
-        expert_outputs = [ae(x) for ae in self.autoencoders]
-        expert_outputs = torch.stack(expert_outputs, dim=1)
+
+        ae_outputs: list[AutoEncoderOutput] = [ae(x) for ae in self.autoencoders]
+        expert_outputs = torch.stack([aeo.decoder_output for aeo in ae_outputs], dim=1)
         x_hat = (expert_outputs * routing_probs.unsqueeze(-1)).sum(dim=1)
-        return x_hat, routing_logits, expert_outputs
+        return RoutedAutoEncoderOutput(x_hat, routing_logits, expert_outputs)
 
 class RouterLoss(nn.Module):
     """
@@ -244,24 +281,33 @@ class RouterLoss(nn.Module):
         mean_logits = routing_logits.mean(dim=0)
         return self.mean_loss(mean_logits, torch.zeros_like(mean_logits))
 
-
+class RoutedAutoEncoderModuleConfig(BaseModel):
+    loss_fn: str
+    moe_repro_loss_weight: float
+    router_loss_weight: float
+    top_expert_loss_weight: float
+    sampled_expert_loss_weight: float
+    scaled_loss_weight: float
+    learning_rate: float
 
 class RoutedAutoEncoderModule(LightningModule):
     def __init__(
         self,
         *,
         inner: RoutedAutoEncoder,
-        loss_fn: str,
-        router_loss_weight: float,
-        learning_rate: float,
+        args: RoutedAutoEncoderModuleConfig,
         on_val_epoch_end_clb: Callable
     ):
         super().__init__()
         self.inner = inner
-        self.loss_fn = self.get_loss_fn(loss_fn)
+        self.loss_fn = self.get_loss_fn(args.loss_fn)
         self.router_loss = RouterLoss()
-        self.router_loss_weight = router_loss_weight
-        self.learning_rate = learning_rate
+        self.moe_repro_loss_weight = args.moe_repro_loss_weight
+        self.router_loss_weight = args.router_loss_weight
+        self.top_expert_loss_weight = args.top_expert_loss_weight
+        self.sampled_expert_loss_weight = args.sampled_expert_loss_weight
+        self.scaled_loss_weight = args.scaled_loss_weight
+        self.learning_rate = args.learning_rate
         self.on_val_epoch_end_clb = on_val_epoch_end_clb
 
 
@@ -272,30 +318,97 @@ class RoutedAutoEncoderModule(LightningModule):
         else:
             raise ValueError(f"Loss function {loss_fn} is not supported")
 
-    def forward(self, batch: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, batch: torch.Tensor) -> RoutedAutoEncoderOutput:
         x, = batch
-        x_hat, routing_logits, expert_outputs = self.inner(x) # (x_hat, routing_logits, expert_outputs)
-        return x_hat, routing_logits, expert_outputs
+        rae_out = self.inner(x)
+        return rae_out
+    
+    def get_top_expert_outputs(self, expert_outputs: torch.Tensor, routing_logits: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            expert_outputs: (batch_size, num_experts, output_dim)
+            routing_logits: (batch_size, num_experts)
+        Returns:
+            (batch_size, output_dim)
+        """
+        top_expert_idx = routing_logits.argmax(dim=1)
+        return expert_outputs[torch.arange(expert_outputs.size(0)), top_expert_idx]
+    
+    def sample_expert_outputs(self, expert_outputs: torch.Tensor, routing_logits: torch.Tensor) -> torch.Tensor:
+        """
+        Samples the expert to choose based on the router probabilities.
+        Args:
+            expert_outputs: (batch_size, num_experts, output_dim)
+            routing_logits: (batch_size, num_experts)
+        Returns:
+            (batch_size, output_dim)
+        """
+        routing_probs = torch.softmax(routing_logits, dim=-1)
+        expert_idx = torch.multinomial(routing_probs, 1).squeeze(-1)
+        return expert_outputs[torch.arange(expert_outputs.size(0)), expert_idx]
+        
     
     def training_step(self, batch: torch.Tensor, batch_idx: int):
         x, = batch
-        x_hat, routing_logits, expert_outputs = self.inner(x)
-        repro_loss = self.loss_fn(x, x_hat)
-        router_loss = self.router_loss(routing_logits)
-        loss = repro_loss + self.router_loss_weight * router_loss
+        rae_out = self.inner(x)
+        moe_repro_loss = self.loss_fn(x, rae_out.reconstruction)
+        router_loss = self.router_loss(rae_out.routing_logits)
+        
+        top_expert_outputs = self.get_top_expert_outputs(rae_out.expert_outputs, rae_out.routing_logits)
+        top_expert_loss = self.loss_fn(x, top_expert_outputs)
+
+        sampled_expert_outputs = self.sample_expert_outputs(rae_out.expert_outputs, rae_out.routing_logits)
+        sampled_expert_loss = self.loss_fn(x, sampled_expert_outputs)
+
+        # scale individual expert losses by the router probabilities
+        router_probs = torch.softmax(rae_out.routing_logits, dim=-1)  # (batch_size, num_experts)
+        expert_diffs = x.unsqueeze(1) - rae_out.expert_outputs  # (batch_size, num_experts, output_dim)
+        expert_losses = (expert_diffs ** 2).mean(dim=-1)  # (batch_size, num_experts)
+        scaled_expert_losses = (router_probs * expert_losses).sum(dim=-1)  # (batch_size,)
+        
+
+        loss = moe_repro_loss * self.moe_repro_loss_weight \
+            + self.router_loss_weight * router_loss \
+            + self.top_expert_loss_weight * top_expert_loss \
+            + self.sampled_expert_loss_weight * sampled_expert_loss \
+            + self.scaled_loss_weight * scaled_expert_losses.mean()
+
         self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
-        self.log("router_loss", router_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+        self.log("router_loss", router_loss, on_step=True, on_epoch=True, prog_bar=False, logger=True)
+        self.log("top_expert_loss", top_expert_loss, on_step=True, on_epoch=True, prog_bar=False, logger=True)
+
         return loss
     
     def validation_step(self, batch: torch.Tensor, batch_idx: int):
         x, = batch
-        x_hat, routing_logits, expert_outputs = self.inner(x)
-        repro_loss = self.loss_fn(x, x_hat)
-        router_loss = self.router_loss(routing_logits)
-        loss = repro_loss + self.router_loss_weight * router_loss
+        rae_out = self.inner(x)
+        moe_repro_loss = self.loss_fn(x, rae_out.reconstruction)
+        router_loss = self.router_loss(rae_out.routing_logits)
+        
+        top_expert_outputs = self.get_top_expert_outputs(rae_out.expert_outputs, rae_out.routing_logits)
+        top_expert_loss = self.loss_fn(x, top_expert_outputs)
+
+        sampled_expert_outputs = self.sample_expert_outputs(rae_out.expert_outputs, rae_out.routing_logits)
+        sampled_expert_loss = self.loss_fn(x, sampled_expert_outputs)
+
+        # scale individual expert losses by the router probabilities
+        router_probs = torch.softmax(rae_out.routing_logits, dim=-1)  # (batch_size, num_experts)
+        expert_diffs = x.unsqueeze(1) - rae_out.expert_outputs  # (batch_size, num_experts, output_dim)
+        expert_losses = (expert_diffs ** 2).mean(dim=-1)  # (batch_size, num_experts)
+        scaled_expert_losses = (router_probs * expert_losses).sum(dim=-1)  # (batch_size,)
+        
+
+        loss = moe_repro_loss * self.moe_repro_loss_weight \
+            + self.router_loss_weight * router_loss \
+            + self.top_expert_loss_weight * top_expert_loss \
+            + self.sampled_expert_loss_weight * sampled_expert_loss \
+            + self.scaled_loss_weight * scaled_expert_losses.mean()
+
         self.log("val_loss", loss)
-        self.log("val_repro_loss", repro_loss)
+        self.log("val_repro_loss", moe_repro_loss)
         self.log("val_router_loss", router_loss)
+        self.log("val_top_expert_loss", top_expert_loss)
+        self.log("val_sampled_expert_loss", sampled_expert_loss)
         return loss
     
     def on_validation_epoch_end(self) -> None:
@@ -304,19 +417,42 @@ class RoutedAutoEncoderModule(LightningModule):
         print(f"val_loss: {self.trainer.callback_metrics['val_loss']}")
         print(f"val_repro_loss: {self.trainer.callback_metrics['val_repro_loss']}")
         print(f"val_router_loss: {self.trainer.callback_metrics['val_router_loss']}")
+        print(f"val_top_expert_loss: {self.trainer.callback_metrics['val_top_expert_loss']}")
+        print(f"val_sampled_expert_loss: {self.trainer.callback_metrics['val_sampled_expert_loss']}")
         print()
         self.on_val_epoch_end_clb(self.trainer, self)
 
     
     def test_step(self, batch: torch.Tensor, batch_idx: int):
         x, = batch
-        x_hat, routing_logits, expert_outputs = self.inner(x)
-        repro_loss = self.loss_fn(x, x_hat)
-        router_loss = self.router_loss(routing_logits)
-        loss = repro_loss + self.router_loss_weight * router_loss
+        rae_out = self.inner(x)
+        moe_repro_loss = self.loss_fn(x, rae_out.reconstruction)
+        router_loss = self.router_loss(rae_out.routing_logits)
+        
+        top_expert_outputs = self.get_top_expert_outputs(rae_out.expert_outputs, rae_out.routing_logits)
+        top_expert_loss = self.loss_fn(x, top_expert_outputs)
+
+        sampled_expert_outputs = self.sample_expert_outputs(rae_out.expert_outputs, rae_out.routing_logits)
+        sampled_expert_loss = self.loss_fn(x, sampled_expert_outputs)
+
+        # scale individual expert losses by the router probabilities
+        router_probs = torch.softmax(rae_out.routing_logits, dim=-1)  # (batch_size, num_experts)
+        expert_diffs = x.unsqueeze(1) - rae_out.expert_outputs  # (batch_size, num_experts, output_dim)
+        expert_losses = (expert_diffs ** 2).mean(dim=-1)  # (batch_size, num_experts)
+        scaled_expert_losses = (router_probs * expert_losses).sum(dim=-1)  # (batch_size,)
+        
+
+        loss = moe_repro_loss * self.moe_repro_loss_weight \
+            + self.router_loss_weight * router_loss \
+            + self.top_expert_loss_weight * top_expert_loss \
+            + self.sampled_expert_loss_weight * sampled_expert_loss \
+            + self.scaled_loss_weight * scaled_expert_losses.mean()
+
         self.log("test_loss", loss)
-        self.log("test_repro_loss", repro_loss)
+        self.log("test_repro_loss", moe_repro_loss)
         self.log("test_router_loss", router_loss)
+        self.log("test_top_expert_loss", top_expert_loss)
+        self.log("test_sampled_expert_loss", sampled_expert_loss)
         return loss
     
     def configure_optimizers(self):

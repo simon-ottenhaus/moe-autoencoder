@@ -8,8 +8,8 @@ from lightning import Callback, LightningDataModule, Trainer
 from lightning.pytorch.callbacks import ModelCheckpoint
 from torch.utils.data import DataLoader, TensorDataset
 
-from model_definition import (FCEncoderConfig, RoutedAutoEncoder,
-                              RoutedAutoEncoderModule)
+from model_definition import (FCEncoderConfig, GaussianNoiseConfig, RoutedAutoEncoder,
+                              RoutedAutoEncoderModule, RoutedAutoEncoderModuleConfig)
 
 
 class SyntheticDataModule(LightningDataModule):
@@ -191,18 +191,39 @@ def train_model(
     
     target_dir.mkdir(parents=True, exist_ok=True)
     
+    batch_size = 128
 
-    dm = SyntheticDataModule(1_000, 1_000, 1_000, 32, function)
+    dm = SyntheticDataModule(20_000, 1_000, 1_000, batch_size, function)
     print(dm)
     
     encoder_args = FCEncoderConfig(input_dim=2, hidden_dim=100, output_dim=1, num_blocks=3, dropout=0.1, inner_activation="relu", output_activation="tanh")
     decoder_args = FCEncoderConfig(input_dim=1, hidden_dim=100, output_dim=2, num_blocks=3, dropout=0.1, inner_activation="relu", output_activation="linear")
     router_args = FCEncoderConfig(input_dim=2, hidden_dim=100, output_dim=num_experts, num_blocks=3, dropout=0.1, inner_activation="relu", output_activation="linear")
-    model = RoutedAutoEncoder(encoder_args=encoder_args, decoder_args=decoder_args, router_args=router_args, num_experts=num_experts)
+    latent_noise_args = GaussianNoiseConfig(std=0.1, mean=0)
+    router_noise_args = GaussianNoiseConfig(std=0.1, mean=0)
+
+    model = RoutedAutoEncoder(
+        encoder_args=encoder_args, 
+        decoder_args=decoder_args, 
+        router_args=router_args, 
+        num_experts=num_experts, 
+        latent_noise_args=latent_noise_args,
+        router_noise_args=router_noise_args,
+        )
+    
     print(model)
     title = f"{function} - {num_experts} experts"
     viz_clb = VisualizePredictionsCallback(dm, target_dir, title)
-    module = RoutedAutoEncoderModule(inner=model, loss_fn="mse", learning_rate=1e-3, router_loss_weight=1, on_val_epoch_end_clb=viz_clb.on_validation_epoch_end)
+    raem_args = RoutedAutoEncoderModuleConfig(
+        loss_fn="mse", 
+        learning_rate=1e-3, 
+        moe_repro_loss_weight=1,
+        router_loss_weight=1, 
+        top_expert_loss_weight=0, 
+        sampled_expert_loss_weight=0,
+        scaled_loss_weight=1,
+        )
+    module = RoutedAutoEncoderModule(inner=model, args=raem_args, on_val_epoch_end_clb=viz_clb.on_validation_epoch_end)
     print(module)
 
     callbacks=[ModelCheckpoint(dirpath=target_dir, filename="model-{epoch:02d}", save_top_k=-1)]
@@ -217,19 +238,21 @@ def train_model(
 
 
 if __name__ == "__main__":
+    train_model("circle", 8)
+
     train_model("circle", 1)
     train_model("circle", 2)
     train_model("circle", 4)
     train_model("circle", 8)
 
-    train_model("spiral", 1)
-    train_model("spiral", 2)
-    train_model("spiral", 4)
-    train_model("spiral", 8)
-
     train_model("figure8", 1)
     train_model("figure8", 2)
     train_model("figure8", 4)
     train_model("figure8", 8)
+
+    train_model("spiral", 1)
+    train_model("spiral", 2)
+    train_model("spiral", 4)
+    train_model("spiral", 8)
 
     
